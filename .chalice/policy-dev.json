@@ -1,4 +1,4 @@
-"""went back and forth just making an iam policy in aws"""
+{
   "Version": "2012-10-17",
   "Statement": [
     {

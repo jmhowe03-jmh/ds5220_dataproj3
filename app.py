@@ -14,6 +14,8 @@ import io
 import logging
 import os
 import time
+import math
+import time as _time
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -292,7 +294,7 @@ def index():
             "Tracks hourly weather in Syracuse, NY (temperature, humidity, and wind) "
             "using Open-Meteo API, DynamoDB, chalice, S3, lambda... plot regenerated hourly"
         ),
-        "resources": ["current", "trend", "plot"],
+        "resources": ["current", "trend", "plot", "compare", "alerts"],
     }
 
 
@@ -387,3 +389,198 @@ def plot():
     url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{PLOT_KEY}"
     log.info("GET /plot → %s", url)
     return {"response": url}
+
+
+@app.route("/compare")
+def compare():
+    """
+    Compare the most recent weather reading to the reading from ~24 hours ago.
+    Searches a ±30-minute window around the 24-hour-ago timestamp so a missed
+    ingest run doesn't cause a total failure.
+    Returns a graceful message if less than 24 hours of data has been collected.
+    """
+    log.info("GET /compare")
+    try:
+        table = _get_table()
+
+        # --- Most recent reading -------------------------------------------
+        resp_now = table.query(
+            KeyConditionExpression=Key("location_id").eq(CITY),
+            ScanIndexForward=False,
+            Limit=1,
+        )
+        now_items = resp_now.get("Items", [])
+        if not now_items:
+            log.warning("GET /compare — no data in DynamoDB yet")
+            return {"response": "No data collected yet — check back after the ingestion Lambda has run."}
+
+        now = now_items[0]
+        now_ts = int(now["timestamp"])
+
+        # --- Reading from ~24 hours ago (±30 min window) ------------------
+        target_ts  = now_ts - 86400          # exactly 24 hours back
+        window_low  = str(target_ts - 1800)  # -30 minutes
+        window_high = str(target_ts + 1800)  # +30 minutes
+
+        log.info(
+            "Searching for 24h-ago record | window=[%s, %s]",
+            window_low, window_high,
+        )
+
+        from boto3.dynamodb.conditions import Key as _Key, Attr
+        resp_ago = table.query(
+            KeyConditionExpression=(
+                _Key("location_id").eq(CITY) &
+                _Key("timestamp").between(window_low, window_high)
+            ),
+            ScanIndexForward=False,
+            Limit=1,
+        )
+        ago_items = resp_ago.get("Items", [])
+
+        if not ago_items:
+            # Work out how much data we actually have
+            all_items = _query_all(table)
+            if len(all_items) < 2:
+                hours_collected = 0
+            else:
+                oldest_ts = int(all_items[0]["timestamp"])
+                hours_collected = round((now_ts - oldest_ts) / 3600, 1)
+
+            log.info(
+                "GET /compare — no 24h-ago data found | hours_collected=%.1f",
+                hours_collected,
+            )
+            return {
+                "response": (
+                    f"Not enough history yet — only ~{hours_collected}h of data collected "
+                    f"(need 24h). Check back later!"
+                )
+            }
+
+        ago = ago_items[0]
+        ago_ts  = int(ago["timestamp"])
+        ago_dt  = datetime.fromtimestamp(ago_ts,  tz=timezone.utc)
+        now_dt  = datetime.fromtimestamp(now_ts,  tz=timezone.utc)
+
+        now_temp  = float(now["temp_f"])
+        ago_temp  = float(ago["temp_f"])
+        now_humid = float(now["humidity"])
+        ago_humid = float(ago["humidity"])
+        now_wind  = float(now["wind_mph"])
+        ago_wind  = float(ago["wind_mph"])
+
+        delta_t = now_temp  - ago_temp
+        delta_h = now_humid - ago_humid
+        delta_w = now_wind  - ago_wind
+
+        def _arrow(delta, threshold=0.5):
+            if   delta >  threshold: return f"↑ +{delta:.1f}"
+            elif delta < -threshold: return f"↓ {delta:.1f}"
+            else:                    return f"→ {delta:+.1f}"
+
+        msg = (
+            f"Syracuse weather comparison — "
+            f"Now ({now_dt.strftime('%m/%d %H:%M UTC')}) vs "
+            f"24h ago ({ago_dt.strftime('%m/%d %H:%M UTC')}): "
+            f"Temp {now_temp:.1f}°F {_arrow(delta_t)}°F | "
+            f"Humidity {now_humid:.0f}% {_arrow(delta_h)}% | "
+            f"Wind {now_wind:.1f} mph {_arrow(delta_w)} mph"
+        )
+        log.info("GET /compare → %s", msg)
+        return {"response": msg}
+
+    except Exception as exc:
+        log.exception("GET /compare failed: %s", exc)
+        return {"response": f"Error running comparison: {exc}"}
+
+
+@app.route("/alerts")
+def alerts():
+    """
+    Scan the full history and flag any readings where temperature or humidity
+    deviated more than 2 standard deviations from the mean — likely weather
+    events worth calling out. Returns up to the 5 most recent anomalies, or
+    a 'no anomalies' message if everything looks normal.
+    """
+    log.info("GET /alerts")
+    try:
+        table = _get_table()
+        items = _query_all(table)
+
+        if len(items) < 6:
+            log.info("GET /alerts — not enough data (%d records)", len(items))
+            return {
+                "response": (
+                    f"Not enough history to detect anomalies yet "
+                    f"({len(items)} record(s) — need at least 6). Check back soon!"
+                )
+            }
+
+        temps  = [float(i["temp_f"])   for i in items]
+        humids = [float(i["humidity"]) for i in items]
+
+        # --- Compute mean and population std dev (pure Python, no numpy) --
+        def _stats(values):
+            n    = len(values)
+            mean = sum(values) / n
+            std  = math.sqrt(sum((x - mean) ** 2 for x in values) / n)
+            return mean, std
+
+        mean_t, std_t = _stats(temps)
+        mean_h, std_h = _stats(humids)
+        threshold = 2.0   # standard deviations
+
+        log.info(
+            "Anomaly thresholds | temp mean=%.2f std=%.2f | humid mean=%.2f std=%.2f",
+            mean_t, std_t, mean_h, std_h,
+        )
+
+        # --- Flag anomalies -----------------------------------------------
+        anomalies = []
+        for item in items:
+            ts    = int(item["timestamp"])
+            dt    = datetime.fromtimestamp(ts, tz=timezone.utc)
+            temp  = float(item["temp_f"])
+            humid = float(item["humidity"])
+            flags = []
+
+            if abs(temp  - mean_t) > threshold * std_t:
+                direction = "high" if temp > mean_t else "low"
+                flags.append(f"temp {direction} ({temp:.1f}°F, avg {mean_t:.1f}°F)")
+
+            if abs(humid - mean_h) > threshold * std_h:
+                direction = "high" if humid > mean_h else "low"
+                flags.append(f"humidity {direction} ({humid:.0f}%, avg {mean_h:.0f}%)")
+
+            if flags:
+                anomalies.append({
+                    "ts": ts,
+                    "dt": dt.strftime("%m/%d %H:%M UTC"),
+                    "flags": flags,
+                })
+
+        log.info("GET /alerts — found %d anomaly record(s) out of %d", len(anomalies), len(items))
+
+        if not anomalies:
+            return {
+                "response": (
+                    f"No anomalies detected across {len(items)} readings "
+                    f"(±2σ thresholds: temp {mean_t:.1f}±{threshold*std_t:.1f}°F, "
+                    f"humidity {mean_h:.0f}±{threshold*std_h:.0f}%)."
+                )
+            }
+
+        # Return the 5 most recent anomalies
+        recent = sorted(anomalies, key=lambda x: x["ts"], reverse=True)[:5]
+        lines  = [f"{a['dt']}: {', '.join(a['flags'])}" for a in recent]
+        msg = (
+            f"{len(anomalies)} anomaly/anomalies detected across {len(items)} readings "
+            f"(±2σ). Most recent: {' | '.join(lines)}"
+        )
+        log.info("GET /alerts → %s", msg)
+        return {"response": msg}
+
+    except Exception as exc:
+        log.exception("GET /alerts failed: %s", exc)
+        return {"response": f"Error scanning for anomalies: {exc}"}
