@@ -1,4 +1,4 @@
-# ds5220 Data Project 3: Weather Tracker (again updated...)
+# ds5220 Data Project 3: Weather Tracker (building off project 2)
 ## vxx4kn Jillian Howe
 In this project we took live weather data from my hometown of Syracuse, NY and made an interactive app that can be accessed via the classes discord chat bot. When requested the app gives information drawn from current or recent temperature, humidity, and wind currently available. Compared to project 2, we updated the code so that the temperature is in the current units (Farenheit rather than celcius). Additional resources were adding to compare readings from ~24 hours ago, and to flag any anomalies in the data. If I were to add onto this project I would make sure to change the time from UTC to local EST time, or include both in my plot. Additionally, adding a second weather tracker for Charlottesville would be interesting to compare the two in real time.
 
