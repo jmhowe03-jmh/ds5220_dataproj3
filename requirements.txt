@@ -1,0 +1,2 @@
+requests
+#boto3 #don't need cuz aws preinstalls it
